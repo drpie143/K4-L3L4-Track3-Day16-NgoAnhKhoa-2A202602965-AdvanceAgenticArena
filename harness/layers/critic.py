@@ -79,16 +79,66 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+
+        kept_claims = []
+        should_abstain = bool(report.get("abstain", False))
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text", "")
+            if not isinstance(text, str) or not text.strip():
+                continue
+
+            if ctx.saw(text):
+                kept_claims.append(claim)
+                continue
+
+            # Thử tách câu ghép mâu thuẫn (trường hợp (c))
+            split_result = self._split_compound(ctx, text)
+            if split_result is not None:
+                (p1, d1), (p2, d2) = split_result
+                kept_claims.append({"text": p1, "doc_id": d1})
+                kept_claims.append({"text": p2, "doc_id": d2})
+                should_abstain = True
+            # Không tách được -> câu bịa: bỏ qua
+
+        if not kept_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ trong tài liệu để trả lời câu hỏi."
+        else:
+            report["abstain"] = should_abstain
+            report["claims"] = kept_claims
+            report["citations"] = sorted({c["doc_id"] for c in kept_claims if c.get("doc_id")})
+
+        return report
+
+    def _split_compound(self, ctx, text: str):
+        delims = [" và và ", " và "]
+        for delim in delims:
+            if delim not in text:
+                continue
+            parts = text.split(delim)
+            for i in range(1, len(parts)):
+                p1 = delim.join(parts[:i]).strip()
+                p2 = delim.join(parts[i:]).strip()
+                if not (ctx.saw(p1) and ctx.saw(p2)):
+                    continue
+                d1 = self._find_doc(ctx, p1)
+                d2 = self._find_doc(ctx, p2)
+                if d1 and d2 and d1 != d2:
+                    return (p1, d1), (p2, d2)
+        return None
+
+    def _find_doc(self, ctx, text: str):
+        if not getattr(ctx, "corpus", None):
+            return None
+        for doc in ctx.corpus.docs:
+            if doc.body in ctx.observed_text and any(text in line for line in doc.body.splitlines()):
+                return doc.doc_id
+        return None
